@@ -1,13 +1,13 @@
 import { Aspect, OperationBase, OperationOptions } from './operation';
 import { ReadConcern } from '../read_concern';
 import { WriteConcern, WriteConcernOptions } from '../write_concern';
-import { maxWireVersion, MongoDBNamespace, Callback } from '../utils';
+import { maxWireVersion, MongoDBNamespace, Callback, deepFreeze } from '../utils';
 import { ReadPreference, ReadPreferenceLike } from '../read_preference';
 import { commandSupportsReadConcern } from '../sessions';
 import { MongoError } from '../error';
 import type { Logger } from '../logger';
 import type { Server } from '../sdam/server';
-import type { Document } from '../bson';
+import type { BSONSerializeOptions, Document } from '../bson';
 import type { CollationOptions } from '../cmap/wire_protocol/write_command';
 import type { ReadConcernLike } from './../read_concern';
 
@@ -35,9 +35,14 @@ export interface CommandOperationOptions extends OperationOptions, WriteConcernO
   noResponse?: boolean;
 }
 
+export interface OperationParentPrivate extends BSONSerializeOptions {
+  options?: BSONSerializeOptions;
+  namespace: MongoDBNamespace;
+}
+
 /** @internal */
 export interface OperationParent {
-  s: { namespace: MongoDBNamespace };
+  s: OperationParentPrivate;
   readConcern?: ReadConcern;
   writeConcern?: WriteConcern;
   readPreference?: ReadPreference;
@@ -53,9 +58,29 @@ export abstract class CommandOperation<
   readPreference: ReadPreference;
   readConcern?: ReadConcern;
   writeConcern?: WriteConcern;
-  explain: boolean;
   fullResponse?: boolean;
   logger?: Logger;
+
+  protected collation;
+  protected maxTimeMS;
+  protected comment;
+  protected retryWrites;
+  protected noResponse;
+
+  get builtOptions(): Readonly<CommandOperationOptions> {
+    return deepFreeze({
+      ...super.builtOptions,
+      collation: this.collation,
+      maxTimeMS: this.maxTimeMS,
+      comment: this.comment,
+      retryWrites: this.retryWrites,
+      noResponse: this.noResponse,
+      fullResponse: this.fullResponse
+      // Override with proper type
+      // writeConcern: this.writeConcern,
+      // readConcern: this.readConcern
+    });
+  }
 
   constructor(parent?: OperationParent, options?: T) {
     super(options);
@@ -75,21 +100,45 @@ export abstract class CommandOperation<
     const propertyProvider = this.hasAspect(Aspect.NO_INHERIT_OPTIONS) ? undefined : parent;
     this.readPreference = this.hasAspect(Aspect.WRITE_OPERATION)
       ? ReadPreference.primary
-      : ReadPreference.resolve(propertyProvider, this.options);
-    this.readConcern = resolveReadConcern(propertyProvider, this.options);
-    this.writeConcern = resolveWriteConcern(propertyProvider, this.options);
+      : ReadPreference.resolve(propertyProvider, options);
+    this.readConcern = resolveReadConcern(propertyProvider, options);
+    this.writeConcern = resolveWriteConcern(propertyProvider, options);
     this.explain = false;
     this.fullResponse =
       options && typeof options.fullResponse === 'boolean' ? options.fullResponse : false;
+
+    // if (this.writeConcern && this.writeConcern.w === 0) {
+    //   if (this.session && this.session.explicit) {
+    //     throw new MongoError('Cannot have explicit session with unacknowledged writes');
+    //   }
+    //   return;
+    // }
 
     // TODO: A lot of our code depends on having the read preference in the options. This should
     //       go away, but also requires massive test rewrites.
     this.options.readPreference = this.readPreference;
 
+    this.collation = options?.collation;
+    this.maxTimeMS = options?.maxTimeMS;
+    this.comment = options?.comment;
+    this.retryWrites = options?.retryWrites;
+    this.noResponse = options?.noResponse;
+
     // TODO(NODE-2056): make logger another "inheritable" property
     if (parent && parent.logger) {
       this.logger = parent.logger;
     }
+
+    const parentOptions = { ...parent?.s.options, ...parent?.s };
+    this.bsonOptions = {
+      raw: options?.raw ?? parentOptions?.raw ?? false,
+      promoteLongs: options?.promoteLongs ?? parentOptions?.promoteLongs ?? true,
+      promoteValues: options?.promoteValues ?? parentOptions?.promoteValues ?? true,
+      promoteBuffers: options?.promoteBuffers ?? parentOptions?.promoteBuffers ?? false,
+      ignoreUndefined: options?.ignoreUndefined ?? parentOptions?.ignoreUndefined ?? false,
+      serializeFunctions: options?.serializeFunctions ?? parentOptions?.serializeFunctions ?? false,
+      fieldsAsRaw: options?.fieldsAsRaw ?? parentOptions?.fieldsAsRaw ?? {}
+    };
   }
 
   abstract execute(server: Server, callback: Callback<TResult>): void;
@@ -98,7 +147,6 @@ export abstract class CommandOperation<
     // TODO: consider making this a non-enumerable property
     this.server = server;
 
-    const options = this.options;
     const serverWireVersion = maxWireVersion(server);
     const inTransaction = this.session && this.session.inTransaction();
 
@@ -106,7 +154,7 @@ export abstract class CommandOperation<
       Object.assign(cmd, { readConcern: this.readConcern });
     }
 
-    if (options.collation && serverWireVersion < SUPPORTS_WRITE_CONCERN_AND_COLLATION) {
+    if (this.builtOptions.collation && serverWireVersion < SUPPORTS_WRITE_CONCERN_AND_COLLATION) {
       callback(
         new MongoError(
           `Server ${server.name}, which reports wire version ${serverWireVersion}, does not support collation`
@@ -120,17 +168,17 @@ export abstract class CommandOperation<
         Object.assign(cmd, { writeConcern: this.writeConcern });
       }
 
-      if (options.collation && typeof options.collation === 'object') {
-        Object.assign(cmd, { collation: options.collation });
+      if (this.builtOptions.collation && typeof this.builtOptions.collation === 'object') {
+        Object.assign(cmd, { collation: this.builtOptions.collation });
       }
     }
 
-    if (typeof options.maxTimeMS === 'number') {
-      cmd.maxTimeMS = options.maxTimeMS;
+    if (typeof this.builtOptions.maxTimeMS === 'number') {
+      cmd.maxTimeMS = this.builtOptions.maxTimeMS;
     }
 
-    if (typeof options.comment === 'string') {
-      cmd.comment = options.comment;
+    if (typeof this.builtOptions.comment === 'string') {
+      cmd.comment = this.builtOptions.comment;
     }
 
     if (this.logger && this.logger.isDebug()) {
@@ -140,7 +188,7 @@ export abstract class CommandOperation<
     server.command(
       this.ns.toString(),
       cmd,
-      { fullResult: !!this.fullResponse, ...this.options },
+      { fullResult: !!this.fullResponse, ...this.builtOptions },
       callback
     );
   }
