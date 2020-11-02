@@ -21,13 +21,13 @@ export interface AggregationCursorOptions extends CursorOptions, AggregateOption
  * @public
  */
 export class AggregationCursor extends AbstractCursor {
-  parent: OperationParent; // TEMPORARY
+  parent?: OperationParent; // TEMPORARY
   pipeline: Document[];
   options: AggregateOptions;
 
   /** @internal */
   constructor(
-    parent: OperationParent,
+    parent: OperationParent | undefined,
     topology: Topology,
     pipeline: Document[] = [],
     options: AggregateOptions = {}
